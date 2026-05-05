@@ -59,10 +59,10 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 chat_id=chat_id,
                 text=(
                     f"👋 Welcome, {name}! We're glad you found us!\n\n"
-                    f"To fully join our community, you'll need a Telegram username ~~\n\n"
+                    f"To fully join our community, you'll need a Telegram username 🫶 ~~\n\n"
                     f"📱 How to set one up:\n"
                     f"Settings → Edit Profile → Username\n\n"
-                    f"Once done, you're all set to participate. See you inside! 🚀\n\n"
+                    f"Once done, you're all set to participate. See you inside! 🚀🫶\n\n"
                     f"_(This message will be removed in 30 seconds)_"
                 ),
                 parse_mode="Markdown",
