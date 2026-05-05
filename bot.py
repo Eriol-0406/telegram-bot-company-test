@@ -1,3 +1,4 @@
+import asyncio
 import os
 import logging
 from datetime import datetime, timedelta
@@ -54,16 +55,27 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         # Case 1: No username set — always fires regardless of cooldown
         if not member.username:
-            await context.bot.send_message(
+            sent = await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    f"Hey {name}!\n\n"
-                    f"In order to be accepted in the group, "
-                    f"please set up a username first.\n\n"
-                    f"Go to: Telegram Settings > Edit Profile > Username"
+                    f"👋 Welcome, {name}! We're glad you found us!\n\n"
+                    f"To fully join our community, you'll need a Telegram username ~~\n\n"
+                    f"📱 How to set one up:\n"
+                    f"Settings → Edit Profile → Username\n\n"
+                    f"Once done, you're all set to participate. See you inside! 🚀\n\n"
+                    f"_(This message will be removed in 30 seconds)_"
                 ),
+                parse_mode="Markdown",
             )
             logger.info(f"{name} has no username, prompted to set one.")
+        
+            # Auto-delete after 30 seconds
+            await asyncio.sleep(30)
+            await context.bot.delete_message(
+                chat_id=chat_id,
+                message_id=sent.message_id,
+            )
+            logger.info(f"Deleted no-username prompt for {name}.")
             continue
 
         # Case 2: Has username but cooldown not over — skip silently
@@ -80,8 +92,8 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         # Case 3: Has username + cooldown is over — send full welcome
         welcome_text = (
-            f"Hello, Web3 Fellows! Welcome to the official CCACC Chat!\n\n"
-            f"CCACC is Malaysia's premier Web3 Innovation Hub, "
+            f"Hello, Web3 Fellows! 👋 Welcome to the official CCACC Chat!\n\n"
+            f"CCACC is Malaysia's premier Web3 Innovation Hub 🚀, "
             f"dedicated to connecting the local blockchain ecosystem to the global stage "
             f"through capital, acceleration, and compliance."
         )
