@@ -1,7 +1,9 @@
 import asyncio
+import json
 import os
 import logging
 from datetime import datetime, timedelta
+from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -18,8 +20,9 @@ BOT_TOKEN     = os.getenv("BOT_TOKEN")
 WEBSITE_URL   = os.getenv("WEBSITE_URL", "https://www.ccacc.io/")
 X_URL         = os.getenv("X_URL", "https://x.com/ccacc_hub")
 INSTAGRAM_URL = os.getenv("INSTAGRAM_URL", "https://www.instagram.com/ccacc_hub")
-FORM_URL = os.getenv("FORM_URL", "https://forms.gle/RUa2FBhRDiJjHu199")
-BANNER_URL = os.getenv("BANNER_URL", "https://raw.githubusercontent.com/Eriol-0406/telegram-bot-company/main/welcome_banner.jpeg")
+FORM_URL      = os.getenv("FORM_URL", "https://forms.gle/RUa2FBhRDiJjHu199")
+BANNER_URL    = os.getenv("BANNER_URL", "https://raw.githubusercontent.com/Eriol-0406/telegram-bot-company/main/welcome_banner.jpeg")
+GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")  # The group chat ID to track
 
 # Logging setup
 logging.basicConfig(
@@ -28,16 +31,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# In-memory cooldown tracker { chat_id: datetime }
+# ── Persistent data file ──────────────────────────────────────────────
+DATA_FILE = Path(os.getenv("DATA_FILE", "bot_data.json"))
+
+
+def _load_data() -> dict:
+    if DATA_FILE.exists():
+        try:
+            return json.loads(DATA_FILE.read_text())
+        except Exception:
+            logger.warning("Corrupt data file, starting fresh.")
+    return {"new_users": [], "left_users": [], "activity": {}}
+
+
+def _save_data(data: dict):
+    DATA_FILE.write_text(json.dumps(data, default=str, indent=2))
+
+
+data = _load_data()
+
+# ── Welcome cooldown ──────────────────────────────────────────────────
 last_welcome_sent: dict[int, datetime] = {}
 COOLDOWN_HOURS = 24
 
-# In-memory new user tracker { chat_id: list of (user_id, name, username, joined_at) }
-new_user_log: dict[int, list[dict]] = {}
-
 
 def is_cooldown_over(chat_id: int) -> bool:
-    """Return True if cooldown has passed since last welcome in this chat."""
     last = last_welcome_sent.get(chat_id)
     if last is None:
         return True
@@ -45,49 +63,148 @@ def is_cooldown_over(chat_id: int) -> bool:
 
 
 def update_cooldown(chat_id: int):
-    """Reset the cooldown timer for this chat."""
     last_welcome_sent[chat_id] = datetime.now()
 
 
+# ── Tracking helpers ──────────────────────────────────────────────────
+def _is_tracked_group(chat_id: int) -> bool:
+    """Check if this chat is the group we're tracking."""
+    if GROUP_CHAT_ID is None:
+        return True  # Track all groups if not configured
+    return str(chat_id) == str(GROUP_CHAT_ID)
+
+
 def log_new_user(chat_id: int, member):
-    """Record a new user join for the /newusers command."""
-    if chat_id not in new_user_log:
-        new_user_log[chat_id] = []
-    new_user_log[chat_id].append({
+    data["new_users"].append({
+        "chat_id": chat_id,
         "user_id": member.id,
         "first_name": member.first_name or "",
         "username": member.username or "",
-        "joined_at": datetime.now(),
+        "joined_at": datetime.now().isoformat(),
     })
+    _save_data(data)
+
+
+def log_left_user(chat_id: int, member):
+    data["left_users"].append({
+        "chat_id": chat_id,
+        "user_id": member.id,
+        "first_name": member.first_name or "",
+        "username": member.username or "",
+        "left_at": datetime.now().isoformat(),
+    })
+    _save_data(data)
+
+
+def track_activity(chat_id: int, user):
+    uid = str(user.id)
+    if uid not in data["activity"]:
+        data["activity"][uid] = {
+            "user_id": user.id,
+            "first_name": user.first_name or "",
+            "username": user.username or "",
+            "message_count": 0,
+            "first_seen": datetime.now().isoformat(),
+            "last_seen": datetime.now().isoformat(),
+            "daily": {},
+        }
+    entry = data["activity"][uid]
+    entry["first_name"] = user.first_name or entry["first_name"]
+    entry["username"] = user.username or entry["username"]
+    entry["message_count"] += 1
+    entry["last_seen"] = datetime.now().isoformat()
+
+    # Track daily message counts for trend analysis
+    today = datetime.now().strftime("%Y-%m-%d")
+    entry["daily"][today] = entry["daily"].get(today, 0) + 1
+
+    # Keep only last 90 days of daily data
+    cutoff = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+    entry["daily"] = {k: v for k, v in entry["daily"].items() if k >= cutoff}
+
+    _save_data(data)
+
+
+# ── Admin check (works for both group and DM context) ─────────────────
+async def is_admin(bot, user_id: int, group_chat_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(group_chat_id, user_id)
+        return member.status in ("administrator", "creator")
+    except Exception as e:
+        logger.error(f"Admin check failed for user {user_id}: {e}")
+        return False
+
+
+def _get_group_id(context_args) -> int | None:
+    """Resolve which group to report on."""
+    if context_args:
+        try:
+            return int(context_args[0])
+        except ValueError:
+            pass
+    if GROUP_CHAT_ID:
+        return int(GROUP_CHAT_ID)
+    return None
+
+
+async def _require_private_admin(update, context) -> int | None:
+    """Ensure command is in private chat and user is group admin.
+    Returns the group_chat_id or None if checks fail."""
+    if update.effective_chat.type != "private":
+        # Silently ignore — don't reveal analytics commands exist in group
+        try:
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=update.message.message_id,
+            )
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text="Please use admin commands here in our private chat only.",
+        )
+        return None
+
+    group_id = _get_group_id(context.args)
+    if group_id is None:
+        await update.message.reply_text(
+            "No group configured. Set GROUP_CHAT_ID env var, "
+            "or pass the group ID: /newusers <group_id> [days]"
+        )
+        return None
+
+    if not await is_admin(context.bot, update.effective_user.id, group_id):
+        await update.message.reply_text("You are not an admin of the tracked group.")
+        return None
+
+    return group_id
 
 
 async def _delete_message_later(bot, chat_id: int, message_id: int, delay: int):
-    """Delete a message after a delay without blocking the caller."""
     try:
         await asyncio.sleep(delay)
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
-        logger.info(f"Deleted auto-remove message {message_id} in chat {chat_id}.")
     except Exception as e:
         logger.warning(f"Failed to delete message {message_id}: {e}")
 
 
-# Welcome handler
+# ── Group handlers (silent tracking) ─────────────────────────────────
+
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for member in update.message.new_chat_members:
-
-        # Ignore bots joining
         if member.is_bot:
             continue
 
         chat_id = update.effective_chat.id
-        name    = member.first_name or member.username or "Builder"
+        name = member.first_name or member.username or "Builder"
 
         logger.info(f"New member joined: {name} (id={member.id})")
 
-        # Track every new (non-bot) user
-        log_new_user(chat_id, member)
+        # Silently track
+        if _is_tracked_group(chat_id):
+            log_new_user(chat_id, member)
 
-        # Case 1: No username set — always fires regardless of cooldown
+        # Case 1: No username — prompt (always, ignore cooldown)
         if not member.username:
             try:
                 sent = await context.bot.send_message(
@@ -103,9 +220,6 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     ),
                     parse_mode="Markdown",
                 )
-                logger.info(f"{name} has no username, prompted to set one.")
-
-                # Schedule deletion without blocking the loop
                 asyncio.create_task(
                     _delete_message_later(context.bot, chat_id, sent.message_id, 30)
                 )
@@ -113,19 +227,12 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 logger.error(f"Failed to send no-username prompt for {name}: {e}")
             continue
 
-        # Case 2: Has username but cooldown not over — skip silently
+        # Case 2: Cooldown active — skip
         if not is_cooldown_over(chat_id):
-            remaining  = last_welcome_sent[chat_id] + timedelta(hours=COOLDOWN_HOURS) - datetime.now()
-            hours_left = int(remaining.total_seconds() // 3600)
-            mins_left  = int((remaining.total_seconds() % 3600) // 60)
-            logger.info(
-                f"Cooldown active for chat {chat_id}. "
-                f"Next welcome in {hours_left}h {mins_left}m. "
-                f"Skipping welcome for {name}."
-            )
+            logger.info(f"Cooldown active, skipping welcome for {name}.")
             continue
 
-        # Case 3: Has username + cooldown is over — send full welcome
+        # Case 3: Full welcome
         try:
             welcome_text = (
                 f"Hello, Web3 Fellows! 👋 Welcome to the official CCACC Chat!\n\n"
@@ -133,20 +240,13 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"dedicated to connecting the local blockchain ecosystem to the global stage "
                 f"through capital, acceleration, and compliance."
             )
-
             if BANNER_URL:
                 await context.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=BANNER_URL,
-                    caption=welcome_text,
+                    chat_id=chat_id, photo=BANNER_URL, caption=welcome_text,
                 )
             else:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=welcome_text,
-                )
+                await context.bot.send_message(chat_id=chat_id, text=welcome_text)
 
-            # Inline buttons
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🌐 Website",   url=WEBSITE_URL)],
                 [InlineKeyboardButton("𝕏  Twitter",   url=X_URL)],
@@ -154,93 +254,305 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 [InlineKeyboardButton("📩 Apply for Internship", url=FORM_URL)],
             ])
             await context.bot.send_message(
-                chat_id=chat_id,
-                text="🔗 Quick Links:",
-                reply_markup=keyboard,
+                chat_id=chat_id, text="🔗 Quick Links:", reply_markup=keyboard,
             )
-
-            # Update cooldown AFTER successfully sending welcome
             update_cooldown(chat_id)
             logger.info(f"Welcome sent to {name} (@{member.username}). Cooldown reset.")
-
         except Exception as e:
             logger.error(f"Failed to send welcome for {name}: {e}")
 
 
-# /newusers command — admin only
-async def newusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def track_left_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    member = update.message.left_chat_member
+    if member and not member.is_bot:
+        chat_id = update.effective_chat.id
+        if _is_tracked_group(chat_id):
+            log_left_user(chat_id, member)
+            logger.info(f"Member left: {member.first_name} (id={member.id})")
+
+
+async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Silently track every message for activity stats."""
+    if update.effective_user and update.effective_user.is_bot:
+        return
     chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
+    if update.effective_chat.type in ("group", "supergroup") and _is_tracked_group(chat_id):
+        track_activity(chat_id, update.effective_user)
 
-    # Only works in groups
-    if update.effective_chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("This command only works in group chats.")
+
+# ── Private DM admin commands ────────────────────────────────────────
+
+async def cmd_newusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show new users. Usage: /newusers [days]"""
+    group_id = await _require_private_admin(update, context)
+    if group_id is None:
         return
 
-    # Check if the user is an admin
-    try:
-        member = await context.bot.get_chat_member(chat_id, user_id)
-        if member.status not in ("administrator", "creator"):
-            await update.message.reply_text("This command is for admins only.")
-            return
-    except Exception as e:
-        logger.error(f"Failed to check admin status for user {user_id}: {e}")
-        await update.message.reply_text("Could not verify admin status. Please try again.")
-        return
-
-    # Parse optional day filter: /newusers 7  (default: all time)
     days = None
-    if context.args:
+    # First arg might be group_id (already consumed), parse remaining
+    args = context.args or []
+    for arg in args:
         try:
-            days = int(context.args[0])
+            val = int(arg)
+            if val > 0 and val < 10000:  # looks like days, not a chat ID
+                days = val
         except ValueError:
-            await update.message.reply_text("Usage: /newusers [days]\nExample: /newusers 7")
-            return
+            pass
 
-    users = new_user_log.get(chat_id, [])
+    users = [u for u in data["new_users"] if str(u["chat_id"]) == str(group_id)]
 
     if days is not None:
-        cutoff = datetime.now() - timedelta(days=days)
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
         users = [u for u in users if u["joined_at"] >= cutoff]
-        period_text = f"in the last {days} day(s)"
+        period = f"last {days} day(s)"
     else:
-        period_text = "since bot started"
+        period = "since tracking started"
 
     count = len(users)
-
     if count == 0:
-        await update.message.reply_text(f"No new users {period_text}.")
+        await update.message.reply_text(f"No new users {period}.")
         return
 
-    # Build summary
-    lines = [f"📊 *New Users {period_text}:* {count}\n"]
-    # Show the most recent 20
-    for u in users[-20:]:
+    lines = [f"*New Users ({period}):* {count}\n"]
+    for u in users[-25:]:
         display = f"@{u['username']}" if u["username"] else u["first_name"]
-        joined = u["joined_at"].strftime("%Y-%m-%d %H:%M")
-        lines.append(f"  • {display} — {joined}")
-
-    if count > 20:
-        lines.append(f"\n_(showing last 20 of {count})_")
+        joined = u["joined_at"][:16].replace("T", " ")
+        lines.append(f"  {display} — {joined}")
+    if count > 25:
+        lines.append(f"\n_(showing last 25 of {count})_")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-# Error handler
+async def cmd_left(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show users who left. Usage: /left [days]"""
+    group_id = await _require_private_admin(update, context)
+    if group_id is None:
+        return
+
+    days = None
+    for arg in (context.args or []):
+        try:
+            val = int(arg)
+            if 0 < val < 10000:
+                days = val
+        except ValueError:
+            pass
+
+    users = [u for u in data["left_users"] if str(u["chat_id"]) == str(group_id)]
+
+    if days is not None:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        users = [u for u in users if u["left_at"] >= cutoff]
+        period = f"last {days} day(s)"
+    else:
+        period = "since tracking started"
+
+    count = len(users)
+    if count == 0:
+        await update.message.reply_text(f"No users left {period}.")
+        return
+
+    lines = [f"*Users Left ({period}):* {count}\n"]
+    for u in users[-25:]:
+        display = f"@{u['username']}" if u["username"] else u["first_name"]
+        left = u["left_at"][:16].replace("T", " ")
+        lines.append(f"  {display} — {left}")
+    if count > 25:
+        lines.append(f"\n_(showing last 25 of {count})_")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show most active users. Usage: /active [days]"""
+    group_id = await _require_private_admin(update, context)
+    if group_id is None:
+        return
+
+    days = 7  # default
+    for arg in (context.args or []):
+        try:
+            val = int(arg)
+            if 0 < val < 10000:
+                days = val
+        except ValueError:
+            pass
+
+    cutoff_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    ranked = []
+    for uid, info in data["activity"].items():
+        recent_msgs = sum(
+            count for date, count in info["daily"].items() if date >= cutoff_date
+        )
+        if recent_msgs > 0:
+            ranked.append((recent_msgs, info))
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
+
+    if not ranked:
+        await update.message.reply_text(f"No activity in the last {days} day(s).")
+        return
+
+    lines = [f"*Most Active Users (last {days} days):*\n"]
+    for i, (count, info) in enumerate(ranked[:20], 1):
+        display = f"@{info['username']}" if info["username"] else info["first_name"]
+        last_seen = info["last_seen"][:16].replace("T", " ")
+        lines.append(f"  {i}. {display} — {count} msgs (last: {last_seen})")
+
+    total_msgs = sum(c for c, _ in ranked)
+    lines.append(f"\n_Total: {total_msgs} messages from {len(ranked)} users_")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_inactive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show users inactive for N days. Usage: /inactive [days] (default 7)"""
+    group_id = await _require_private_admin(update, context)
+    if group_id is None:
+        return
+
+    days = 7
+    for arg in (context.args or []):
+        try:
+            val = int(arg)
+            if 0 < val < 10000:
+                days = val
+        except ValueError:
+            pass
+
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+
+    inactive = []
+    for uid, info in data["activity"].items():
+        if info["last_seen"] < cutoff:
+            inactive.append(info)
+
+    inactive.sort(key=lambda x: x["last_seen"])
+
+    if not inactive:
+        await update.message.reply_text(f"No inactive users (>{days} days).")
+        return
+
+    lines = [f"*Inactive Users (no messages in {days}+ days):* {len(inactive)}\n"]
+    for info in inactive[:25]:
+        display = f"@{info['username']}" if info["username"] else info["first_name"]
+        last = info["last_seen"][:16].replace("T", " ")
+        lines.append(f"  {display} — last seen {last} ({info['message_count']} total msgs)")
+    if len(inactive) > 25:
+        lines.append(f"\n_(showing 25 of {len(inactive)})_")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Overall group summary. Usage: /stats"""
+    group_id = await _require_private_admin(update, context)
+    if group_id is None:
+        return
+
+    gid = str(group_id)
+    total_joined = len([u for u in data["new_users"] if str(u["chat_id"]) == gid])
+    total_left = len([u for u in data["left_users"] if str(u["chat_id"]) == gid])
+    total_tracked = len(data["activity"])
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    month_ago = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+
+    joined_today = len([u for u in data["new_users"]
+                        if str(u["chat_id"]) == gid and u["joined_at"][:10] == today])
+    joined_week = len([u for u in data["new_users"]
+                       if str(u["chat_id"]) == gid and u["joined_at"][:10] >= week_ago])
+    joined_month = len([u for u in data["new_users"]
+                        if str(u["chat_id"]) == gid and u["joined_at"][:10] >= month_ago])
+
+    left_week = len([u for u in data["left_users"]
+                     if str(u["chat_id"]) == gid and u["left_at"][:10] >= week_ago])
+
+    msgs_today = sum(
+        info["daily"].get(today, 0) for info in data["activity"].values()
+    )
+    msgs_week = sum(
+        sum(c for d, c in info["daily"].items() if d >= week_ago)
+        for info in data["activity"].values()
+    )
+    active_today = sum(
+        1 for info in data["activity"].values() if info["daily"].get(today, 0) > 0
+    )
+
+    lines = [
+        "*Group Analytics Dashboard*\n",
+        "*Membership:*",
+        f"  Joined (total): {total_joined}",
+        f"  Joined today: {joined_today}",
+        f"  Joined (7d): {joined_week}",
+        f"  Joined (30d): {joined_month}",
+        f"  Left (7d): {left_week}",
+        f"  Net growth (7d): {joined_week - left_week}",
+        "",
+        "*Activity:*",
+        f"  Tracked users: {total_tracked}",
+        f"  Messages today: {msgs_today}",
+        f"  Messages (7d): {msgs_week}",
+        f"  Active today: {active_today} users",
+    ]
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show available admin commands (private DM only)."""
+    if update.effective_chat.type != "private":
+        return  # Silently ignore in groups
+
+    await update.message.reply_text(
+        "*Admin Commands* (DM only)\n\n"
+        "/stats — Group dashboard overview\n"
+        "/newusers [days] — New user joins\n"
+        "/left [days] — Users who left\n"
+        "/active [days] — Most active users (default 7d)\n"
+        "/inactive [days] — Gone quiet users (default 7d)\n"
+        "/adminhelp — This help message\n\n"
+        "_All commands verify you're a group admin._",
+        parse_mode="Markdown",
+    )
+
+
+# ── Error handler ────────────────────────────────────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Exception while handling update: {context.error}")
 
 
-# Main
+# ── Main ─────────────────────────────────────────────────────────────
 def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN is missing! Check your .env or Railway variables.")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(
-        MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member)
-    )
-    app.add_handler(CommandHandler("newusers", newusers_command))
+
+    # Group handlers
+    app.add_handler(MessageHandler(
+        filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member
+    ))
+    app.add_handler(MessageHandler(
+        filters.StatusUpdate.LEFT_CHAT_MEMBER, track_left_member
+    ))
+    # Track all text/media messages for activity (low priority so it doesn't block others)
+    app.add_handler(MessageHandler(
+        filters.ALL & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
+        track_message,
+    ), group=1)
+
+    # Private DM admin commands
+    app.add_handler(CommandHandler("newusers", cmd_newusers))
+    app.add_handler(CommandHandler("left", cmd_left))
+    app.add_handler(CommandHandler("active", cmd_active))
+    app.add_handler(CommandHandler("inactive", cmd_inactive))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("adminhelp", cmd_help))
+
     app.add_error_handler(error_handler)
 
     logger.info("Bot is running... Waiting for new members.")
