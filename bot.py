@@ -22,7 +22,10 @@ X_URL         = os.getenv("X_URL", "https://x.com/ccacc_hub")
 INSTAGRAM_URL = os.getenv("INSTAGRAM_URL", "https://www.instagram.com/ccacc_hub")
 FORM_URL      = os.getenv("FORM_URL", "https://forms.gle/RUa2FBhRDiJjHu199")
 BANNER_URL    = os.getenv("BANNER_URL", "https://raw.githubusercontent.com/Eriol-0406/telegram-bot-company/main/welcome_banner.jpeg")
-GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")  # The group chat ID to track
+GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")  # Auto-detected if not set
+
+# Cooldown: set COOLDOWN_MINUTES env var for testing (default 1440 = 24 hours)
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "1440"))
 
 # Logging setup
 logging.basicConfig(
@@ -41,7 +44,7 @@ def _load_data() -> dict:
             return json.loads(DATA_FILE.read_text())
         except Exception:
             logger.warning("Corrupt data file, starting fresh.")
-    return {"new_users": [], "left_users": [], "activity": {}}
+    return {"new_users": [], "left_users": [], "activity": {}, "group_chat_id": None}
 
 
 def _save_data(data: dict):
@@ -52,28 +55,47 @@ data = _load_data()
 
 # ── Welcome cooldown ──────────────────────────────────────────────────
 last_welcome_sent: dict[int, datetime] = {}
-COOLDOWN_HOURS = 24
 
 
 def is_cooldown_over(chat_id: int) -> bool:
     last = last_welcome_sent.get(chat_id)
     if last is None:
         return True
-    return datetime.now() - last >= timedelta(hours=COOLDOWN_HOURS)
+    return datetime.now() - last >= timedelta(minutes=COOLDOWN_MINUTES)
 
 
 def update_cooldown(chat_id: int):
     last_welcome_sent[chat_id] = datetime.now()
 
 
-# ── Tracking helpers ──────────────────────────────────────────────────
+# ── Group ID resolution ──────────────────────────────────────────────
+def _get_tracked_group_id() -> int | None:
+    """Get the group chat ID from env, or auto-detected from data."""
+    if GROUP_CHAT_ID:
+        return int(GROUP_CHAT_ID)
+    if data.get("group_chat_id"):
+        return int(data["group_chat_id"])
+    return None
+
+
+def _auto_detect_group(chat_id: int):
+    """Auto-detect and save the group chat ID on first group interaction."""
+    if GROUP_CHAT_ID:
+        return  # Env var takes priority
+    if data.get("group_chat_id") is None:
+        data["group_chat_id"] = chat_id
+        _save_data(data)
+        logger.info(f"Auto-detected group chat ID: {chat_id}")
+
+
 def _is_tracked_group(chat_id: int) -> bool:
-    """Check if this chat is the group we're tracking."""
-    if GROUP_CHAT_ID is None:
-        return True  # Track all groups if not configured
-    return str(chat_id) == str(GROUP_CHAT_ID)
+    group_id = _get_tracked_group_id()
+    if group_id is None:
+        return True  # Track all groups until one is detected
+    return chat_id == group_id
 
 
+# ── Tracking helpers ──────────────────────────────────────────────────
 def log_new_user(chat_id: int, member):
     data["new_users"].append({
         "chat_id": chat_id,
@@ -114,7 +136,6 @@ def track_activity(chat_id: int, user):
     entry["message_count"] += 1
     entry["last_seen"] = datetime.now().isoformat()
 
-    # Track daily message counts for trend analysis
     today = datetime.now().strftime("%Y-%m-%d")
     entry["daily"][today] = entry["daily"].get(today, 0) + 1
 
@@ -125,33 +146,22 @@ def track_activity(chat_id: int, user):
     _save_data(data)
 
 
-# ── Admin check (works for both group and DM context) ─────────────────
+# ── Admin check ───────────────────────────────────────────────────────
 async def is_admin(bot, user_id: int, group_chat_id: int) -> bool:
     try:
         member = await bot.get_chat_member(group_chat_id, user_id)
+        logger.info(f"Admin check: user {user_id} status='{member.status}' in chat {group_chat_id}")
         return member.status in ("administrator", "creator")
     except Exception as e:
-        logger.error(f"Admin check failed for user {user_id}: {e}")
+        logger.error(f"Admin check failed for user {user_id} in chat {group_chat_id}: {e}")
         return False
-
-
-def _get_group_id(context_args) -> int | None:
-    """Resolve which group to report on."""
-    if context_args:
-        try:
-            return int(context_args[0])
-        except ValueError:
-            pass
-    if GROUP_CHAT_ID:
-        return int(GROUP_CHAT_ID)
-    return None
 
 
 async def _require_private_admin(update, context) -> int | None:
     """Ensure command is in private chat and user is group admin.
     Returns the group_chat_id or None if checks fail."""
     if update.effective_chat.type != "private":
-        # Silently ignore — don't reveal analytics commands exist in group
+        # Silently delete command in group, redirect to DM
         try:
             await context.bot.delete_message(
                 chat_id=update.effective_chat.id,
@@ -159,22 +169,33 @@ async def _require_private_admin(update, context) -> int | None:
             )
         except Exception:
             pass
-        await context.bot.send_message(
-            chat_id=update.effective_user.id,
-            text="Please use admin commands here in our private chat only.",
-        )
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text="Please use admin commands here in our private chat only.",
+            )
+        except Exception:
+            pass
         return None
 
-    group_id = _get_group_id(context.args)
+    group_id = _get_tracked_group_id()
     if group_id is None:
         await update.message.reply_text(
-            "No group configured. Set GROUP_CHAT_ID env var, "
-            "or pass the group ID: /newusers <group_id> [days]"
+            "No group detected yet. Either:\n"
+            "1. Set GROUP_CHAT_ID in Railway env vars, or\n"
+            "2. Add the bot to your group first — it auto-detects the group ID.\n\n"
+            "Tip: Add @userinfobot to your group to find the chat ID."
         )
         return None
 
     if not await is_admin(context.bot, update.effective_user.id, group_id):
-        await update.message.reply_text("You are not an admin of the tracked group.")
+        await update.message.reply_text(
+            "You are not an admin of the tracked group.\n\n"
+            "Make sure:\n"
+            "1. The bot is an admin in the group (needed to verify your role)\n"
+            f"2. You are an admin/owner of group {group_id}\n\n"
+            "To make the bot admin: Group Settings → Administrators → Add the bot"
+        )
         return None
 
     return group_id
@@ -198,9 +219,10 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         chat_id = update.effective_chat.id
         name = member.first_name or member.username or "Builder"
 
-        logger.info(f"New member joined: {name} (id={member.id})")
+        logger.info(f"New member joined: {name} (id={member.id}) in chat {chat_id}")
 
-        # Silently track
+        # Auto-detect group and track
+        _auto_detect_group(chat_id)
         if _is_tracked_group(chat_id):
             log_new_user(chat_id, member)
 
@@ -229,7 +251,9 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         # Case 2: Cooldown active — skip
         if not is_cooldown_over(chat_id):
-            logger.info(f"Cooldown active, skipping welcome for {name}.")
+            remaining = last_welcome_sent[chat_id] + timedelta(minutes=COOLDOWN_MINUTES) - datetime.now()
+            mins_left = int(remaining.total_seconds() // 60)
+            logger.info(f"Cooldown active ({mins_left}m left), skipping welcome for {name}.")
             continue
 
         # Case 3: Full welcome
@@ -257,7 +281,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 chat_id=chat_id, text="🔗 Quick Links:", reply_markup=keyboard,
             )
             update_cooldown(chat_id)
-            logger.info(f"Welcome sent to {name} (@{member.username}). Cooldown reset.")
+            logger.info(f"Welcome sent to {name} (@{member.username}). Cooldown reset ({COOLDOWN_MINUTES}m).")
         except Exception as e:
             logger.error(f"Failed to send welcome for {name}: {e}")
 
@@ -266,6 +290,7 @@ async def track_left_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     member = update.message.left_chat_member
     if member and not member.is_bot:
         chat_id = update.effective_chat.id
+        _auto_detect_group(chat_id)
         if _is_tracked_group(chat_id):
             log_left_user(chat_id, member)
             logger.info(f"Member left: {member.first_name} (id={member.id})")
@@ -276,8 +301,10 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and update.effective_user.is_bot:
         return
     chat_id = update.effective_chat.id
-    if update.effective_chat.type in ("group", "supergroup") and _is_tracked_group(chat_id):
-        track_activity(chat_id, update.effective_user)
+    if update.effective_chat.type in ("group", "supergroup"):
+        _auto_detect_group(chat_id)
+        if _is_tracked_group(chat_id):
+            track_activity(chat_id, update.effective_user)
 
 
 # ── Private DM admin commands ────────────────────────────────────────
@@ -289,12 +316,10 @@ async def cmd_newusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     days = None
-    # First arg might be group_id (already consumed), parse remaining
-    args = context.args or []
-    for arg in args:
+    for arg in (context.args or []):
         try:
             val = int(arg)
-            if val > 0 and val < 10000:  # looks like days, not a chat ID
+            if 0 < val < 10000:
                 days = val
         except ValueError:
             pass
@@ -370,7 +395,7 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if group_id is None:
         return
 
-    days = 7  # default
+    days = 7
     for arg in (context.args or []):
         try:
             val = int(arg)
@@ -497,6 +522,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  Messages today: {msgs_today}",
         f"  Messages (7d): {msgs_week}",
         f"  Active today: {active_today} users",
+        "",
+        f"_Cooldown: {COOLDOWN_MINUTES}m | Group: {group_id}_",
     ]
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -505,7 +532,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show available admin commands (private DM only)."""
     if update.effective_chat.type != "private":
-        return  # Silently ignore in groups
+        return
 
     await update.message.reply_text(
         "*Admin Commands* (DM only)\n\n"
@@ -515,7 +542,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/active [days] — Most active users (default 7d)\n"
         "/inactive [days] — Gone quiet users (default 7d)\n"
         "/adminhelp — This help message\n\n"
-        "_All commands verify you're a group admin._",
+        "_All commands verify you're a group admin._\n"
+        "_Bot must be admin in the group for this to work._",
         parse_mode="Markdown",
     )
 
@@ -530,6 +558,12 @@ def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN is missing! Check your .env or Railway variables.")
 
+    logger.info(f"Cooldown set to {COOLDOWN_MINUTES} minutes.")
+    if GROUP_CHAT_ID:
+        logger.info(f"Tracking group: {GROUP_CHAT_ID}")
+    else:
+        logger.info("No GROUP_CHAT_ID set — will auto-detect from first group interaction.")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # Group handlers
@@ -539,7 +573,6 @@ def main():
     app.add_handler(MessageHandler(
         filters.StatusUpdate.LEFT_CHAT_MEMBER, track_left_member
     ))
-    # Track all text/media messages for activity (low priority so it doesn't block others)
     app.add_handler(MessageHandler(
         filters.ALL & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
         track_message,
