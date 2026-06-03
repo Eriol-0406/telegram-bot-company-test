@@ -551,6 +551,20 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reveal the chat ID. Works in groups — auto-deletes after 10s."""
+    chat_id = update.effective_chat.id
+    chat_type = update.effective_chat.type
+    sent = await update.message.reply_text(
+        f"Chat ID: `{chat_id}`\nType: {chat_type}\n\n"
+        f"_(this message will self-destruct in 10 seconds)_",
+        parse_mode="Markdown",
+    )
+    # Delete both the command and the reply after 10 seconds
+    asyncio.create_task(_delete_message_later(context.bot, chat_id, update.message.message_id, 10))
+    asyncio.create_task(_delete_message_later(context.bot, chat_id, sent.message_id, 10))
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show available admin commands (private DM only)."""
     if update.effective_chat.type != "private":
@@ -606,6 +620,7 @@ def main():
     app.add_handler(CommandHandler("active", cmd_active))
     app.add_handler(CommandHandler("inactive", cmd_inactive))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("adminhelp", cmd_help))
 
     app.add_error_handler(error_handler)
