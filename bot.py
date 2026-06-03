@@ -148,13 +148,29 @@ def track_activity(chat_id: int, user):
 
 # ── Admin check ───────────────────────────────────────────────────────
 async def is_admin(bot, user_id: int, group_chat_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(group_chat_id, user_id)
-        logger.info(f"Admin check: user {user_id} status='{member.status}' in chat {group_chat_id}")
-        return member.status in ("administrator", "creator")
-    except Exception as e:
-        logger.error(f"Admin check failed for user {user_id} in chat {group_chat_id}: {e}")
-        return False
+    # Try the stored ID first, then with -100 prefix if it's positive
+    ids_to_try = [group_chat_id]
+    if group_chat_id > 0:
+        ids_to_try.append(int(f"-100{group_chat_id}"))
+
+    for gid in ids_to_try:
+        try:
+            member = await bot.get_chat_member(gid, user_id)
+            logger.info(f"Admin check: user {user_id} status='{member.status}' in chat {gid}")
+            if member.status in ("administrator", "creator"):
+                # Fix the stored group_chat_id if the -100 prefix was needed
+                if gid != group_chat_id and data.get("group_chat_id") == group_chat_id:
+                    data["group_chat_id"] = gid
+                    _save_data(data)
+                    logger.info(f"Fixed stored group_chat_id to {gid}")
+                return True
+            return False
+        except Exception as e:
+            logger.warning(f"Admin check with chat_id {gid} failed: {e}")
+            continue
+
+    logger.error(f"Admin check exhausted all IDs for user {user_id}, group {group_chat_id}")
+    return False
 
 
 async def _require_private_admin(update, context) -> int | None:
@@ -188,13 +204,19 @@ async def _require_private_admin(update, context) -> int | None:
         )
         return None
 
-    if not await is_admin(context.bot, update.effective_user.id, group_id):
+    user_id = update.effective_user.id
+    if not await is_admin(context.bot, user_id, group_id):
+        # Reload in case it was corrected
+        corrected_id = _get_tracked_group_id()
         await update.message.reply_text(
-            "You are not an admin of the tracked group.\n\n"
-            "Make sure:\n"
-            "1. The bot is an admin in the group (needed to verify your role)\n"
-            f"2. You are an admin/owner of group {group_id}\n\n"
-            "To make the bot admin: Group Settings → Administrators → Add the bot"
+            f"Admin check failed.\n\n"
+            f"Your user ID: {user_id}\n"
+            f"Group ID tried: {group_id}\n"
+            f"(also tried: -100{group_id})\n\n"
+            f"Make sure:\n"
+            f"1. The bot is an admin in the group\n"
+            f"2. You are an admin/owner of the group\n\n"
+            f"Check Railway logs for the exact Telegram API error."
         )
         return None
 
